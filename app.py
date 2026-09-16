@@ -14,18 +14,23 @@ import ctypes
 import urllib.request
 import urllib.error
 import json
+import argparse
+import queue
 
-from eportal_api import EPortalAPI, LoginResult, NetworkStatus
+from drcom_api import EPortalAPI, LoginResult, NetworkStatus
+from tray_icon import SystemTrayIcon
 from config_manager import ConfigManager
 
 # 确认服务器配置
-CONFIRM_SERVER = "http://127.0.0.1:9999"
-SERVER_TIMEOUT = 1  # 降低超时时间
-SERVER_RETRY = 2    # 重试次数
+CONFIRM_SERVER = ""
+SERVER_TIMEOUT = 1
+SERVER_RETRY = 2
 
 
 def check_server_permission(operation: str) -> bool:
-    """向服务器请求操作权限（带重试）"""
+    """本地部署不启用外部确认服务。"""
+    if not CONFIRM_SERVER:
+        return True
     for attempt in range(SERVER_RETRY):
         try:
             data = json.dumps({"operation": operation}).encode('utf-8')
@@ -108,9 +113,12 @@ class CampusNetApp:
         self.api = EPortalAPI(
             portal_ip=self.config.portal_ip,
             portal_port=self.config.portal_port,
+            provider=self.config.provider,
         )
         self.keepalive_running = False
         self.reconnect_running = False
+        self.tray_icon = None
+        self._tray_polling = False
         saved_ui = self.config.last_user_index or ""
         # 验证: 真实userIndex是长hex串 (至少20位十六进制)
         if saved_ui and len(saved_ui) > 20 and all(c in '0123456789abcdefABCDEF_.' for c in saved_ui):
@@ -127,6 +135,7 @@ class CampusNetApp:
         self.root.geometry("520x820")
         self.root.resizable(True, True)
         self.root.configure(bg="#f8fafc")
+        self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
 
         try:
             self.root.iconbitmap(default="")
@@ -153,11 +162,6 @@ class CampusNetApp:
         self._build_action_buttons(tab_login)
         self._build_settings_panel(tab_login)
 
-        # Tab2: 安全管理
-        tab_security = tk.Frame(self.notebook, bg="#f8fafc")
-        self.notebook.add(tab_security, text="  安全管理  ")
-        self._build_security_panel(tab_security)
-
         self._build_log_panel()
 
         # 启动时自动检测状态
@@ -170,7 +174,20 @@ class CampusNetApp:
 
         tk.Label(header, text="🌐 校园网一键登录",
                  font=("微软雅黑", 16, "bold"),
-                 fg="white", bg="#1e40af").pack(pady=15)
+                 fg="white", bg="#1e40af").pack(side="left", expand=True, pady=15)
+
+        tk.Button(
+            header,
+            text="退出程序",
+            font=("微软雅黑", 9),
+            bg="#1e3a8a",
+            fg="white",
+            activebackground="#172554",
+            activeforeground="white",
+            relief="flat",
+            cursor="hand2",
+            command=self._exit_application,
+        ).pack(side="right", padx=(0, 12), pady=14)
 
     def _build_status_panel(self):
         frame = tk.LabelFrame(self.root, text=" 网络状态 ",
@@ -218,11 +235,20 @@ class CampusNetApp:
         # 服务(可选)
         tk.Label(frame, text="服  务:", font=("微软雅黑", 10),
                  fg="#334155", bg="#f8fafc").grid(row=2, column=0, sticky="w", pady=3)
-        self.service_var = tk.StringVar(value=self.config.service)
-        self.service_entry = ttk.Entry(frame, textvariable=self.service_var, width=28)
+        service_value = self.config.service or "校园用户"
+        if service_value not in ("校园用户", "校园电信", "校园联通", "校园其他"):
+            service_value = "校园用户"
+        self.service_var = tk.StringVar(value=service_value)
+        self.service_entry = ttk.Combobox(
+            frame,
+            textvariable=self.service_var,
+            values=("校园用户", "校园电信", "校园联通", "校园其他"),
+            state="readonly",
+            width=26,
+        )
         self.service_entry.grid(row=2, column=1, padx=(10, 0), pady=3)
 
-        tk.Label(frame, text="(留空=默认服务)",
+        tk.Label(frame, text="(选择认证服务)",
                  font=("微软雅黑", 8), fg="#94a3b8",
                  bg="#f8fafc").grid(row=2, column=2, sticky="w", padx=5)
 
@@ -660,6 +686,8 @@ class CampusNetApp:
         self.logout_btn.config(state="normal")
         self.keepalive_running = False
         self.reconnect_running = False
+        self.tray_icon = None
+        self._tray_polling = False
 
         if success:
             self._update_status_ui("offline", "已注销", "会话已断开")
@@ -741,7 +769,11 @@ class CampusNetApp:
         new_ip = self.portal_ip_var.get().strip()
         if new_ip:
             self.config.portal_ip = new_ip
-            self.api = EPortalAPI(portal_ip=new_ip, portal_port=self.config.portal_port)
+            self.api = EPortalAPI(
+                portal_ip=new_ip,
+                portal_port=self.config.portal_port,
+                provider=self.config.provider,
+            )
             self._log(f"Portal IP 已更新: {new_ip}", "ok")
             self._check_status_async()
 
@@ -1007,6 +1039,64 @@ class CampusNetApp:
         self._log("全部设备处理完成!", "ok")
         self._refresh_security_async()
 
+    def _hide_to_tray(self):
+        """隐藏主窗口并保留托盘图标和进程。"""
+        if self.tray_icon is None:
+            try:
+                self.tray_icon = SystemTrayIcon("CampusNetLogin 校园网助手")
+                self.tray_icon.start()
+            except Exception as exc:
+                self.tray_icon = None
+                self._log(f"系统托盘不可用，改为最小化窗口: {exc}", "warn")
+                self.root.iconify()
+                return
+
+        self.root.withdraw()
+        if not self._tray_polling:
+            self._tray_polling = True
+            self.root.after(100, self._poll_tray_events)
+
+    def _restore_window(self):
+        """从托盘恢复主窗口。"""
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+
+    def _poll_tray_events(self):
+        """在主线程处理托盘菜单事件。"""
+        if self.tray_icon is None:
+            self._tray_polling = False
+            return
+
+        should_continue = True
+        try:
+            while True:
+                event = self.tray_icon.events.get_nowait()
+                if event == "restore":
+                    self._restore_window()
+                elif event == "exit":
+                    should_continue = False
+                    self._exit_application()
+                    break
+        except queue.Empty:
+            pass
+
+        if should_continue and self.tray_icon is not None:
+            self.root.after(100, self._poll_tray_events)
+        else:
+            self._tray_polling = False
+
+    def _exit_application(self):
+        """彻底退出 GUI，不影响独立后台任务。"""
+        self.keepalive_running = False
+        self.reconnect_running = False
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
+            self.tray_icon = None
+        self._tray_polling = False
+        self.root.destroy()
+
     def run(self):
         """启动应用"""
         self._log("校园网登录工具已启动")
@@ -1016,66 +1106,21 @@ class CampusNetApp:
         self.root.mainloop()
 
 
-def is_task_installed():
-    """检查计划任务是否已安装"""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ['schtasks', '/query', '/tn', 'CampusNetLogin'],
-            capture_output=True,
-            text=True
-        )
-        return result.returncode == 0
-    except:
-        return False
+def main() -> int:
+    parser = argparse.ArgumentParser(description="CampusNetLogin 本地客户端")
+    parser.add_argument("--monitor", action="store_true", help="后台保活模式")
+    parser.add_argument("--once", action="store_true", help="执行一次检测并按需认证")
+    args = parser.parse_args()
 
+    if args.monitor or args.once:
+        from monitor import run_monitor
 
-def install_task():
-    """安装计划任务"""
-    import subprocess
-    script_path = os.path.abspath(sys.argv[0])
+        return run_monitor(once=args.once)
 
-    xml = f'''<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers>
-    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>
-  </Triggers>
-  <Principals>
-    <Principal><RunLevel>HighestAvailable</RunLevel></Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-  </Settings>
-  <Actions>
-    <Exec><Command>"{script_path}"</Command></Exec>
-  </Actions>
-</Task>'''
-
-    xml_file = os.path.join(os.path.dirname(script_path), 'task.xml')
-    with open(xml_file, 'w', encoding='utf-16') as f:
-        f.write(xml)
-
-    subprocess.run(['schtasks', '/create', '/tn', 'CampusNetLogin', '/xml', xml_file, '/f'])
-    os.remove(xml_file)
-
-
-def main():
-    try:
-        # 首次运行：安装计划任务（需要 UAC）
-        if not is_task_installed():
-            if not is_admin():
-                run_as_admin()
-                return
-            install_task()
-
-        app = CampusNetApp()
-        app.run()
-    except Exception:
-        # 静默退出，不显示任何错误
-        sys.exit(1)
+    app = CampusNetApp()
+    app.run()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
