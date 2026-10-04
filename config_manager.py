@@ -144,9 +144,8 @@ class ConfigManager:
             "username": "",
             "password_encrypted": "",
             "service": "校园用户",
-            "auto_keepalive": True,
-            "keepalive_minutes": 5,
-            "auto_reconnect": True,
+            "auto_maintain": True,
+            "router_mode": True,
             "reconnect_interval": 30,
             "start_minimized": True,
             "last_user_index": "",
@@ -160,6 +159,11 @@ class ConfigManager:
                     loaded = json.load(handle)
                 if isinstance(loaded, dict):
                     config.update(loaded)
+                    if "auto_maintain" not in loaded:
+                        config["auto_maintain"] = bool(loaded.get("auto_keepalive", True)
+                                                       or loaded.get("auto_reconnect", True))
+                    if "router_mode" not in loaded:
+                        config["router_mode"] = False
                     password = config.get("password_encrypted", "")
                     if password and not password.startswith(DPAPI_PREFIX):
                         legacy_plain = decrypt_value(password, self.config_dir)
@@ -235,20 +239,38 @@ class ConfigManager:
 
     @property
     def auto_keepalive(self) -> bool:
-        return bool(self._config.get("auto_keepalive", True))
+        return self.auto_maintain
 
     @auto_keepalive.setter
     def auto_keepalive(self, value: bool):
-        self._config["auto_keepalive"] = bool(value)
-        self._save()
+        self.auto_maintain = value
 
     @property
     def auto_reconnect(self) -> bool:
-        return bool(self._config.get("auto_reconnect", True))
+        return self.auto_maintain
 
     @auto_reconnect.setter
     def auto_reconnect(self, value: bool):
+        self.auto_maintain = value
+
+    @property
+    def auto_maintain(self) -> bool:
+        return bool(self._config["auto_maintain"])
+
+    @auto_maintain.setter
+    def auto_maintain(self, value: bool):
+        self._config["auto_maintain"] = bool(value)
+        self._config["auto_keepalive"] = bool(value)
         self._config["auto_reconnect"] = bool(value)
+        self._save()
+
+    @property
+    def router_mode(self) -> bool:
+        return bool(self._config["router_mode"])
+
+    @router_mode.setter
+    def router_mode(self, value: bool):
+        self._config["router_mode"] = bool(value)
         self._save()
 
     @property

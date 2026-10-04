@@ -1,6 +1,6 @@
 """
 校园网一键登录工具 - GUI 主程序
-基于锐捷 ePortal 认证系统
+适配南京工业大学 Dr.COM 门户
 """
 
 import tkinter as tk
@@ -17,9 +17,10 @@ import json
 import argparse
 import queue
 
-from drcom_api import EPortalAPI, LoginResult, NetworkStatus
+from drcom_api import EPortalAPI, LoginResult, NetworkStatus, SERVICE_SUFFIXES
 from tray_icon import SystemTrayIcon
 from config_manager import ConfigManager
+from monitor import MaintenanceMonitor, MonitorSettings, SingleInstance, _configure_logger
 
 # 确认服务器配置
 CONFIRM_SERVER = ""
@@ -84,6 +85,9 @@ class StatusIndicator(tk.Canvas):
         "offline": "#ef4444",    # 红色 - 离线
         "checking": "#f59e0b",   # 黄色 - 检测中
         "connecting": "#3b82f6", # 蓝色 - 连接中
+        "need_login": "#ef4444",
+        "network_error": "#ef4444",
+        "unknown": "#f59e0b",
     }
 
     def __init__(self, parent, size=16, **kwargs):
@@ -114,19 +118,17 @@ class CampusNetApp:
             portal_ip=self.config.portal_ip,
             portal_port=self.config.portal_port,
             provider=self.config.provider,
+            router_mode=self.config.router_mode,
         )
-        self.keepalive_running = False
-        self.reconnect_running = False
+        self._closing = False
+        self._ui_events = queue.Queue()
+        self.monitor = MaintenanceMonitor(
+            self.api, MonitorSettings.from_config(self.config),
+            self._monitor_event, _configure_logger(),
+        )
         self.tray_icon = None
         self._tray_polling = False
-        saved_ui = self.config.last_user_index or ""
-        # 验证: 真实userIndex是长hex串 (至少20位十六进制)
-        if saved_ui and len(saved_ui) > 20 and all(c in '0123456789abcdefABCDEF_.' for c in saved_ui):
-            self.current_user_index = saved_ui
-        else:
-            self.current_user_index = ""
-            if saved_ui:
-                self.config.last_user_index = ""  # 清除坏值
+        self.current_user_index = ""
         self._build_ui()
 
     def _build_ui(self):
@@ -164,8 +166,8 @@ class CampusNetApp:
 
         self._build_log_panel()
 
-        # 启动时自动检测状态
-        self.root.after(500, self._check_status_async)
+        self.root.after(100, self._poll_ui_events)
+        self.root.after(500, self._auto_start_monitor)
 
     def _build_header(self):
         header = tk.Frame(self.root, bg="#1e40af", height=60)
@@ -236,13 +238,13 @@ class CampusNetApp:
         tk.Label(frame, text="服  务:", font=("微软雅黑", 10),
                  fg="#334155", bg="#f8fafc").grid(row=2, column=0, sticky="w", pady=3)
         service_value = self.config.service or "校园用户"
-        if service_value not in ("校园用户", "校园电信", "校园联通", "校园其他"):
+        if service_value not in SERVICE_SUFFIXES:
             service_value = "校园用户"
         self.service_var = tk.StringVar(value=service_value)
         self.service_entry = ttk.Combobox(
             frame,
             textvariable=self.service_var,
-            values=("校园用户", "校园电信", "校园联通", "校园其他"),
+            values=tuple(SERVICE_SUFFIXES),
             state="readonly",
             width=26,
         )
@@ -317,20 +319,18 @@ class CampusNetApp:
                               bg="#f8fafc", padx=15, pady=5)
         frame.pack(fill="x", padx=15, pady=3)
 
-        # 自动保活
-        self.keepalive_var = tk.BooleanVar(value=self.config.auto_keepalive)
-        tk.Checkbutton(frame, text="自动保活 (防止会话超时掉线)",
-                       variable=self.keepalive_var,
+        self.maintain_var = tk.BooleanVar(value=self.config.auto_maintain)
+        tk.Checkbutton(frame, text="自动保活与重连 (每30秒检测)",
+                       variable=self.maintain_var,
                        font=("微软雅黑", 9), bg="#f8fafc",
-                       command=self._on_keepalive_toggle
+                       command=self._on_maintain_toggle
                        ).pack(anchor="w")
 
-        # 断线重连
-        self.reconnect_var = tk.BooleanVar(value=self.config.auto_reconnect)
-        tk.Checkbutton(frame, text="断线自动重连 (每30秒检测)",
-                       variable=self.reconnect_var,
+        self.router_var = tk.BooleanVar(value=self.config.router_mode)
+        tk.Checkbutton(frame, text="通过路由器连接 (从宿舍门户获取出口身份)",
+                       variable=self.router_var,
                        font=("微软雅黑", 9), bg="#f8fafc",
-                       command=self._on_reconnect_toggle
+                       command=self._on_router_toggle
                        ).pack(anchor="w")
 
         # Portal IP 配置
@@ -528,7 +528,7 @@ class CampusNetApp:
             return
 
         username = self.username_var.get().strip()
-        password = self.password_var.get().strip()
+        password = self.password_var.get()
         service = self.service_var.get().strip()
 
         if not username or not password:
@@ -539,6 +539,7 @@ class CampusNetApp:
         self.config.password = password
         self.config.service = service
         self._log("账号信息已加密保存", "ok")
+        self.monitor.configure(MonitorSettings.from_config(self.config))
 
     def _update_status_ui(self, state: str, text: str, detail: str = ""):
         """更新状态显示"""
@@ -546,273 +547,131 @@ class CampusNetApp:
         self.status_label.config(text=text)
         self.status_detail.config(text=detail)
 
+    def _post(self, callback, *args):
+        if not self._closing:
+            self._ui_events.put((callback, args))
+
+    def _monitor_event(self, kind, value):
+        handlers = {
+            "status": self._on_status_result,
+            "login": self._on_login_result,
+            "logout": self._on_logout_result,
+        }
+        if kind == "log":
+            self._post(self._log, *value)
+        elif kind in handlers:
+            self._post(handlers[kind], value)
+
+    def _poll_ui_events(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                callback, args = self._ui_events.get_nowait()
+                callback(*args)
+                if self._closing:
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_ui_events)
+
     def _check_status_async(self):
-        """异步检测网络状态"""
+        if self._closing:
+            return
         self._update_status_ui("checking", "检测中...", "正在探测网络状态")
         self.refresh_btn.config(state="disabled")
-        threading.Thread(target=self._check_status_worker, daemon=True).start()
-
-    def _check_status_worker(self):
-        status = self.api.detect_network_status()
-        self.root.after(0, self._on_status_result, status)
+        self.monitor.request_check()
 
     def _on_status_result(self, status: NetworkStatus):
         self.refresh_btn.config(state="normal")
-
-        # 输出详细调试日志
-        if status.debug_log:
-            self._log("--- 调试日志 ---", "info")
-            for line in status.debug_log:
-                self._log(line, "info")
-            self._log("--- 调试结束 ---", "info")
-
-        if status.online:
-            detail = f"网络连接正常 | {status.message}"
-            if status.user_index and len(status.user_index) > 20:
-                self.current_user_index = status.user_index
-                self.config.last_user_index = status.user_index
-                detail += f" | userIndex已获取"
-            elif self.current_user_index:
-                # 已通过登录获取到userIndex，不需要从Portal重新获取
-                detail += f" | userIndex已持有(来自登录)"
-            self._update_status_ui("online", "✅ 已在线", detail)
-
-            if status.user_index:
-                self._log(f"网络在线 - {status.message} [会话已捕获]", "ok")
-            elif self.current_user_index:
-                self._log(f"网络在线 - {status.message} [会话来自登录，可用]", "ok")
-            else:
-                self._log(f"网络在线 - {status.message} [无会话，请先登录]", "warn")
-        elif status.need_login:
-            self._update_status_ui("offline", "❌ 未登录",
-                                   f"需要认证 | {status.message}")
-            self._log(f"需要登录 - {status.message}", "warn")
-        else:
-            self._update_status_ui("offline", "⚠ 网络异常",
-                                   status.message)
-            self._log(f"状态异常 - {status.message}", "err")
+        labels = {"online": "✅ 已在线", "need_login": "需要认证",
+                  "network_error": "网络故障", "unknown": "状态未知"}
+        self._update_status_ui(status.state, labels[status.state], status.message)
+        for line in status.debug_log:
+            self._log(line)
+        self._log(f"{labels[status.state]}：{status.message}",
+                  "ok" if status.online else "warn")
 
     def _login_async(self, force_relogin=False):
-        """异步登录"""
-        if not check_server_permission("login"):
-            self._log("服务器拒绝：登录操作", "warn")
+        if self._closing or not check_server_permission("login"):
             return
-
         username = self.username_var.get().strip()
-        password = self.password_var.get().strip()
-        service = self.service_var.get().strip()
-
+        password = self.password_var.get()
+        service = self.service_var.get()
         if not username or not password:
             self._log("请先输入用户名和密码", "warn")
             return
-
+        self._save_credentials()
         self.login_btn.config(state="disabled", text="⏳ 登录中...")
-        if force_relogin:
-            self._update_status_ui("connecting", "正在重新登录...", "先注销旧会话，再重新认证")
-            self._log(f"强制重新登录: {username} (先注销再登录)")
-        else:
-            self._update_status_ui("connecting", "正在登录...", "正在向Portal服务器发送认证请求")
-            self._log(f"发起登录请求: {username}")
-
-        threading.Thread(
-            target=self._login_worker,
-            args=(username, password, service, force_relogin),
-            daemon=True
-        ).start()
-
-    def _login_worker(self, username, password, service, force_relogin=False):
-        result = self.api.login(username, password, service, force_relogin=force_relogin)
-        self.root.after(0, self._on_login_result, result)
+        self._update_status_ui("connecting", "正在登录...", "认证后将验证外网连通性")
+        self.monitor.request_login(username, password, service, force_relogin)
 
     def _on_login_result(self, result: LoginResult):
         self.login_btn.config(state="normal", text="⚡ 一键登录")
-
-        # 输出登录调试日志
-        login_debug = result.raw.get("_debug_log", [])
-        if login_debug:
-            self._log("--- 登录调试日志 ---", "info")
-            for line in login_debug:
-                self._log(line, "info")
-            self._log("--- 登录调试结束 ---", "info")
-
+        for line in result.raw.get("_debug_log", []):
+            self._log(line)
         if result.success:
-            ui = result.user_index or ""
-            if ui and len(ui) > 20:
-                self.current_user_index = ui
-                self.config.last_user_index = ui
-                self._log(f"登录成功! userIndex={ui[:30]}... keepalive={result.keepalive_interval}min", "ok")
-            else:
-                self._log(f"登录成功! 但userIndex异常: {ui[:40]}", "warn")
-            self._update_status_ui("online", "✅ 登录成功!", "")
-
-            # 保存凭据
-            self.config.username = self.username_var.get().strip()
-            self.config.password = self.password_var.get().strip()
-            self.config.service = self.service_var.get().strip()
-
-            # 启动保活
-            if self.keepalive_var.get() and result.keepalive_interval > 0:
-                self._start_keepalive(result.keepalive_interval)
-
-            # 启动断线重连
-            if self.reconnect_var.get():
-                self._start_reconnect()
-
-            # 延迟刷新状态确认
-            self.root.after(2000, self._check_status_async)
+            self._update_status_ui("online", "✅ 已在线", result.message)
+            self._log(result.message, "ok")
         else:
-            self._update_status_ui("offline", "❌ 登录失败", result.message)
-            self._log(f"登录失败: {result.message}", "err")
+            state = result.status.state if result.status else "unknown"
+            self._update_status_ui(state, "认证未恢复外网", result.message)
+            self._log(result.message, "warn")
+            if result.permanent_error:
+                self._log("自动认证已暂停，请修改账号配置或手动登录", "warn")
 
     def _logout_async(self):
-        """异步注销"""
-        if not check_server_permission("logout"):
-            self._log("服务器拒绝：注销操作", "warn")
+        if self._closing or not check_server_permission("logout"):
             return
-
-        if not self.current_user_index:
-            self._log("无有效会话可注销", "warn")
-            return
-
         self.logout_btn.config(state="disabled")
-        self._log("正在注销...")
-        threading.Thread(target=self._logout_worker, daemon=True).start()
-
-    def _logout_worker(self):
-        success = self.api.logout(self.current_user_index)
-        self.root.after(0, self._on_logout_result, success)
+        self._log("自动认证已暂停，正在注销...")
+        self.monitor.request_logout()
 
     def _on_logout_result(self, success: bool):
         self.logout_btn.config(state="normal")
-        self.keepalive_running = False
-        self.reconnect_running = False
-        self.tray_icon = None
-        self._tray_polling = False
+        self._update_status_ui("need_login" if success else "unknown",
+                               "已注销" if success else "注销状态未知",
+                               "自动监控已暂停，手动登录后恢复")
+        self._log("注销成功" if success else "注销未确认，请刷新状态检查",
+                  "ok" if success else "warn")
 
-        if success:
-            self._update_status_ui("offline", "已注销", "会话已断开")
-            self._log("注销成功", "ok")
-            self.current_user_index = ""
-            self.config.last_user_index = ""
-        else:
-            self._log("注销请求可能失败，请刷新状态确认", "warn")
-
-        self.root.after(1000, self._check_status_async)
-
-    def _start_keepalive(self, interval_min: int):
-        """启动保活线程"""
-        if self.keepalive_running:
+    def _auto_start_monitor(self):
+        if self._closing:
             return
-        self.keepalive_running = True
-        interval = max(interval_min, 1) * 60  # 至少1分钟
+        self.monitor.start()
+        if not self.config.auto_maintain or not self.config.has_credentials():
+            self.monitor.request_check()
+        if not self.config.has_credentials():
+            self._log("尚未保存账号，保存后按设置启用自动保活与重连", "warn")
 
-        def worker():
-            while self.keepalive_running and self.current_user_index:
-                time.sleep(interval)
-                if self.keepalive_running and self.current_user_index:
-                    ok = self.api.keepalive(self.current_user_index)
-                    self.root.after(0, self._log,
-                                    f"保活心跳 {'成功' if ok else '失败'}",
-                                    "ok" if ok else "warn")
+    def _on_maintain_toggle(self):
+        self.config.auto_maintain = self.maintain_var.get()
+        self.monitor.configure(MonitorSettings.from_config(self.config))
+        self._log("自动保活与重连已开启" if self.config.auto_maintain else "自动保活与重连已关闭")
 
-        self._log(f"保活已启动 (每{interval_min}分钟)", "info")
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _start_reconnect(self):
-        """启动断线重连"""
-        if self.reconnect_running:
-            return
-        self.reconnect_running = True
-        interval = self.config.reconnect_interval
-
-        def worker():
-            while self.reconnect_running:
-                time.sleep(interval)
-                if not self.reconnect_running:
-                    break
-                status = self.api.detect_network_status()
-                if status.need_login and not status.online:
-                    self.root.after(0, self._log, "检测到断线，自动重连...", "warn")
-                    result = self.api.login(
-                        self.config.username,
-                        self.config.password,
-                        self.config.service
-                    )
-                    if result.success:
-                        self.current_user_index = result.user_index
-                        self.config.last_user_index = result.user_index
-                        self.root.after(0, self._log, "自动重连成功!", "ok")
-                        self.root.after(0, self._update_status_ui,
-                                        "online", "✅ 已在线 (自动重连)", "")
-                    else:
-                        self.root.after(0, self._log,
-                                        f"自动重连失败: {result.message}", "err")
-
-        self._log(f"断线重连已启动 (每{interval}秒检测)", "info")
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_keepalive_toggle(self):
-        self.config.auto_keepalive = self.keepalive_var.get()
-        if not self.keepalive_var.get():
-            self.keepalive_running = False
-            self._log("保活已关闭", "info")
-
-    def _on_reconnect_toggle(self):
-        self.config.auto_reconnect = self.reconnect_var.get()
-        if not self.reconnect_var.get():
-            self.reconnect_running = False
-            self._log("自动重连已关闭", "info")
-        elif self.current_user_index:
-            self._start_reconnect()
+    def _on_router_toggle(self):
+        self.config.router_mode = self.router_var.get()
+        self.monitor.configure(MonitorSettings.from_config(self.config))
+        self._log("已切换为路由器出口认证" if self.config.router_mode else "已切换为电脑直连认证")
 
     def _apply_portal_ip(self):
         new_ip = self.portal_ip_var.get().strip()
         if new_ip:
+            import ipaddress
+            try:
+                ipaddress.IPv4Address(new_ip)
+            except ValueError:
+                self._log("请输入有效的 Portal IPv4 地址", "warn")
+                return
             self.config.portal_ip = new_ip
-            self.api = EPortalAPI(
-                portal_ip=new_ip,
-                portal_port=self.config.portal_port,
-                provider=self.config.provider,
-            )
+            self.monitor.configure(MonitorSettings.from_config(self.config))
             self._log(f"Portal IP 已更新: {new_ip}", "ok")
             self._check_status_async()
 
     # ==================== 安全管理逻辑 ====================
 
     def _go_offline_async(self):
-        """本机下线 (注销网络认证)"""
-        if not check_server_permission("offline"):
-            self._log("服务器拒绝：下线操作", "warn")
-            return
-
-        if not self.current_user_index:
-            self._log("无有效会话，尝试强制下线...", "warn")
-
-        self.offline_btn.config(state="disabled", text="⏳ 下线中...")
-        self._log("正在执行下线...")
-
-        def worker():
-            success = False
-            if self.current_user_index:
-                success = self.api.logout(self.current_user_index)
-            if not success:
-                success = self.api.logout_by_ip()
-            self.root.after(0, _on_result, success)
-
-        def _on_result(success):
-            self.offline_btn.config(state="normal", text="🔌 本机下线 (注销网络)")
-            if success:
-                self._log("下线成功! 网络已断开", "ok")
-                self._update_status_ui("offline", "已下线", "网络认证已注销")
-                self.keepalive_running = False
-                self.reconnect_running = False
-                self.current_user_index = ""
-                self.config.last_user_index = ""
-            else:
-                self._log("下线请求已发送，刷新状态确认", "warn")
-            self.root.after(2000, self._check_status_async)
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._logout_async()
 
     def _refresh_security_async(self):
         """异步刷新安全状态"""
@@ -826,7 +685,7 @@ class CampusNetApp:
 
     def _refresh_security_worker(self):
         sec = self.api.get_security_status(self.current_user_index)
-        self.root.after(0, self._on_security_result, sec)
+        self._post(self._on_security_result, sec)
 
     def _on_security_result(self, sec: dict):
         self.refresh_sec_btn.config(state="normal")
@@ -932,7 +791,7 @@ class CampusNetApp:
 
     def _cancel_mac_worker(self):
         result = self.api.cancel_mac(self.current_user_index)
-        self.root.after(0, self._on_cancel_mac_result, result)
+        self._post(self._on_cancel_mac_result, result)
 
     def _on_cancel_mac_result(self, result: dict):
         self.cancel_mac_btn.config(state="normal")
@@ -955,7 +814,7 @@ class CampusNetApp:
 
         def worker():
             result = self.api.force_offline_device(user_id, user_mac)
-            self.root.after(0, _on_result, result)
+            self._post(_on_result, result)
 
         def _on_result(result):
             status = result.get("result", "fail")
@@ -988,7 +847,7 @@ class CampusNetApp:
 
     def _kick_device_worker(self, user_id, user_mac):
         result = self.api.cancel_mac_for_device(user_id, user_mac)
-        self.root.after(0, self._on_kick_device_result, result, user_mac)
+        self._post(self._on_kick_device_result, result, user_mac)
 
     def _on_kick_device_result(self, result: dict, user_mac: str):
         if result.get("result") == "success":
@@ -1019,7 +878,7 @@ class CampusNetApp:
 
         # 先取消本机无感认证
         self.api.cancel_mac(self.current_user_index)
-        self.root.after(0, self._log, "本机无感认证已关闭", "ok")
+        self._post(self._log, "本机无感认证已关闭", "ok")
 
         # 逐个取消其他设备
         for dev in devices:
@@ -1028,11 +887,11 @@ class CampusNetApp:
             if user_id and user_mac:
                 result = self.api.cancel_mac_for_device(user_id, user_mac)
                 status = "ok" if result.get("result") == "success" else "err"
-                self.root.after(0, self._log,
+                self._post(self._log,
                                 f"设备 {user_mac}: {'已取消' if status == 'ok' else '失败'}",
                                 status)
 
-        self.root.after(0, self._on_kick_all_done)
+        self._post(self._on_kick_all_done)
 
     def _on_kick_all_done(self):
         self.kick_all_btn.config(state="normal")
@@ -1041,6 +900,8 @@ class CampusNetApp:
 
     def _hide_to_tray(self):
         """隐藏主窗口并保留托盘图标和进程。"""
+        if self._closing:
+            return
         if self.tray_icon is None:
             try:
                 self.tray_icon = SystemTrayIcon("CampusNetLogin 校园网助手")
@@ -1065,6 +926,8 @@ class CampusNetApp:
 
     def _poll_tray_events(self):
         """在主线程处理托盘菜单事件。"""
+        if self._closing:
+            return
         if self.tray_icon is None:
             self._tray_polling = False
             return
@@ -1088,13 +951,30 @@ class CampusNetApp:
             self._tray_polling = False
 
     def _exit_application(self):
-        """彻底退出 GUI，不影响独立后台任务。"""
-        self.keepalive_running = False
-        self.reconnect_running = False
+        if self._closing:
+            return
+        self._closing = True
+        self._cancel_timers()
+        self.monitor.request_stop()
+        self._update_status_ui("checking", "正在退出...", "等待当前请求结束")
         if self.tray_icon is not None:
             self.tray_icon.stop()
             self.tray_icon = None
         self._tray_polling = False
+        self._finish_exit()
+
+    def _cancel_timers(self):
+        for timer in self.root.tk.call("after", "info"):
+            self.root.after_cancel(timer)
+
+    def _finish_exit(self):
+        if self.monitor.is_running():
+            self.root.after(50, self._finish_exit)
+            return
+        self.monitor.join()
+        if self.monitor._thread is None:
+            self.api.close()
+        self._cancel_timers()
         self.root.destroy()
 
     def run(self):
@@ -1112,14 +992,25 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="执行一次检测并按需认证")
     args = parser.parse_args()
 
-    if args.monitor or args.once:
-        from monitor import run_monitor
-
-        return run_monitor(once=args.once)
-
-    app = CampusNetApp()
-    app.run()
-    return 0
+    instance = SingleInstance()
+    if not instance.acquire():
+        if not (args.monitor or args.once):
+            from tkinter import messagebox
+            messagebox.showinfo("校园网助手", "程序已在运行，请从系统托盘打开；如已启动后台模式，请先停止后台进程。")
+        return 2 if (args.monitor or args.once) else 0
+    try:
+        if args.monitor or args.once:
+            from monitor import run_monitor
+            return run_monitor(once=args.once, locked=True)
+        app = CampusNetApp()
+        try:
+            app.run()
+        finally:
+            app.monitor.request_stop()
+            app.monitor.join()
+        return 0
+    finally:
+        instance.release()
 
 
 if __name__ == "__main__":

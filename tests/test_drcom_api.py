@@ -5,10 +5,11 @@ from drcom_api import EPortalAPI, NetworkStatus
 
 
 class FakeResponse:
-    def __init__(self, text='', status_code=200, headers=None):
+    def __init__(self, text='', status_code=200, headers=None, url='http://a.njtech.edu.cn/'):
         self.text = text
         self.status_code = status_code
         self.headers = headers or {}
+        self.url = url
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -30,7 +31,8 @@ class DrcomApiTests(unittest.TestCase):
 
     def test_telecom_suffix_and_login_request(self):
         self.api.detect_network_status = Mock(
-            return_value=NetworkStatus(need_login=True, message='login required')
+            side_effect=[NetworkStatus(need_login=True, message='login required'),
+                         NetworkStatus(online=True)]
         )
         self.api._load_portal_config = Mock(
             return_value={

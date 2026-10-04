@@ -5,29 +5,23 @@ echo   校园网登录工具 - 打包脚本
 echo ========================================
 echo.
 
-REM 检查 PyInstaller
-python -c "import PyInstaller" 2>nul
-if errorlevel 1 (
-    echo [1/3] 安装 PyInstaller...
-    pip install pyinstaller
-) else (
-    echo [1/3] PyInstaller 已安装
-)
-
-echo.
-echo [2/3] 打包客户端...
-pyinstaller --onefile --windowed --name CampusNetLogin --icon=NONE app.py
-
-echo.
-echo [3/3] 打包服务器...
-pyinstaller --onefile --console --name ConfirmServer confirm_server.py
+cd /d "%~dp0"
+python -m venv build\.venv
+if errorlevel 1 exit /b 1
+build\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-build.txt
+if errorlevel 1 exit /b 1
+build\.venv\Scripts\python.exe -m unittest discover -s tests -v
+if errorlevel 1 exit /b 1
+build\.venv\Scripts\python.exe -m py_compile app.py drcom_api.py monitor.py config_manager.py tray_icon.py
+if errorlevel 1 exit /b 1
+build\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name CampusNetLogin --distpath release --workpath build\pyinstaller --icon=NONE app.py
+if errorlevel 1 exit /b 1
 
 echo.
 echo ========================================
 echo   打包完成！
 echo ========================================
 echo.
-echo 客户端: dist\CampusNetLogin.exe
-echo 服务器: dist\ConfirmServer.exe
+echo 客户端: release\CampusNetLogin.exe
 echo.
-pause
+exit /b 0
