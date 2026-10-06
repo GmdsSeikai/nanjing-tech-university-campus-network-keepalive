@@ -25,9 +25,15 @@ class PortalTransport:
         self.page_count = 0
         self.change_ip = False
         self.missing_identity = False
+        self.missing_mac = False
+        self.page_mac = ''
+        self.status_identity = None
+        self.chkstatus_unknown = False
         self.missing_config = False
         self.prefix = '1'
+        self.check_online_method = '1'
         self.query_result = None
+        self.query_error = None
         self.probe_failure = None
         self.redirect = False
         self.closed = False
@@ -52,22 +58,32 @@ class PortalTransport:
             if self.change_ip and self.page_count > 1:
                 self.ip = '10.40.20.2'
             page = '<script>v4ip="' + ('' if self.missing_identity else self.ip) + '";'
+            page += 'ss4="' + self.page_mac + '";'
             page += '// v4ip="192.168.1.123";\n</script>'
             return FakeResponse(page, url=PORTAL_ENTRY)
         if path == '/drcom/chkstatus':
             payload = {'result': 1 if self.online else 0, 'msg': '用户不在线',
-                       'v46ip': self.ip, 'ss4': '000000000000', 'olmac': '123456789abc'}
+                       'v46ip': self.ip, 'ss4': '000000000000',
+                       'olmac': '' if self.missing_mac else '123456789abc'}
             if self.missing_identity:
                 payload = {'result': 0, 'msg': '用户不在线'}
+            if self.status_identity is not None:
+                payload.update(self.status_identity)
+            if self.chkstatus_unknown:
+                payload['result'] = -1
+                payload['msg'] = '内核状态未知'
         elif path.endswith('/page/loadConfig'):
             payload = {'code': 1, 'data': {'login_method': '1', 'program_index': 'p',
                        'page_index': 'i', 'account_prefix': self.prefix,
-                       'check_online_method': '1', 'ac_logout': '1'}}
+                       'check_online_method': self.check_online_method, 'ac_logout': '1'}}
             if self.missing_config:
                 del payload['data']['page_index']
         elif path.endswith('/online_list'):
-            payload = self.query_result or {'result': 1 if self.online else 0,
-                        'msg': '在线' if self.online else '用户不在线'}
+            if self.query_error:
+                raise self.query_error
+            payload = self.query_result if self.query_result is not None else {
+                'result': 1, 'msg': '查询成功', 'total': 1 if self.online else 0,
+                'list': [{'online_ip': self.ip, 'online_mac': '123456789abc'}] if self.online else []}
         elif path.endswith('/login'):
             payload = {'result': 1 if self.accept_login else 0, 'msg': self.login_message}
             if self.accept_login:
@@ -114,10 +130,200 @@ class RouterAuthTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.status.state, 'network_error')
         self.assertEqual(len(self.transport.submissions()), 1)
+        self.assertEqual(getattr(result, 'phase', None), 'accepted')
+
+    def test_missing_mac_uses_portal_zero_placeholder_and_restores(self):
+        self.assertTrue(self.api.login('student', 'secret', '中国移动').success)
+        self.assertEqual(self.transport.submissions()[0]['wlan_user_mac'], '123456789ABC')
+        self.transport.missing_mac = True
+        self.transport.change_ip = True
+        for page_mac in ('', '000000000000', '111111111111'):
+            with self.subTest(page_mac=page_mac):
+                self.transport.page_mac = page_mac
+                self.transport.internet = self.transport.online = False
+                result = self.api.login('student', 'secret', '中国移动')
+                self.assertTrue(result.success, result.message)
+                params = self.transport.submissions()[-1]
+                self.assertEqual(params['wlan_user_ip'], self.transport.ip)
+                self.assertEqual(params['wlan_user_mac'], '000000000000')
+                self.assertEqual(params['user_account'], ',0,student@cmcc')
+                self.assertEqual(getattr(result, 'phase', None), 'online')
+
+    def test_query_success_requires_matching_current_exit(self):
+        cases = [
+            ({'result': 1, 'total': 0, 'list': []}, 'need_login'),
+            ({'result': '1', 'total': '1', 'list': [{'online_ip': self.transport.ip}]}, 'network_error'),
+            ({'result': 1, 'total': 1, 'list': [{'online_ip': '10.40.20.99'}]}, 'need_login'),
+            ({'result': 1, 'total': 2, 'list': [{'online_ip': '10.40.20.99'},
+                                             {'online_ip': self.transport.ip}]}, 'network_error'),
+        ]
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                self.transport.query_result = payload
+                status = self.api.detect_network_status()
+                self.assertEqual(status.state, expected)
+                self.assertEqual(status.need_login, expected == 'need_login')
+                self.assertFalse(status.online)
+
+    def test_malformed_or_contradictory_lists_stay_unknown(self):
+        self.transport.chkstatus_unknown = True
+        cases = [
+            {}, {'result': 1}, {'result': 1, 'total': 0}, {'result': 1, 'list': []},
+            {'result': 1, 'total': 0, 'list': {}},
+            {'result': 1, 'total': 1, 'list': []},
+            {'result': 1, 'total': 0, 'list': [{'online_ip': self.transport.ip}]},
+            {'result': 1, 'total': -1, 'list': []},
+            {'result': 1, 'total': False, 'list': []},
+            {'result': 1, 'total': 0.0, 'list': []},
+            {'result': 1, 'total': 1, 'list': [{}]},
+            {'result': 1, 'total': 1, 'list': [self.transport.ip]},
+            {'result': 1, 'total': 1, 'list': [{'online_ip': 'invalid'}]},
+            {'result': 1, 'total': 1, 'list': [{'online_ip': False}]},
+            {'result': 1, 'total': 0, 'list': [], 'online': True},
+            {'result': 0, 'total': 1, 'list': [{'online_ip': self.transport.ip}], 'msg': '用户不在线'},
+            {'result': 1, 'total': 1, 'list': [{'online_ip': self.transport.ip}], 'online': False},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                self.transport.query_result = payload
+                result = self.api.login('student', 'secret', '中国移动')
+                self.assertFalse(result.success)
+                self.assertEqual(result.status.state, 'unknown')
+                self.assertEqual(getattr(result, 'phase', None), 'not_submitted')
+        self.assertEqual(self.transport.submissions(), [])
+
+    def test_redirect_survives_online_query_success(self):
+        self.transport.redirect = True
+        self.transport.query_result = {'result': 1}
+        status = self.api.detect_network_status()
+        self.assertTrue(status.need_login)
+        self.assertEqual(status.redirect_url, PORTAL_ENTRY)
+        self.assertTrue(self.api.login('student', 'secret', '中国移动').success)
+        self.assertEqual(len(self.transport.submissions()), 1)
+
+    def test_matching_list_does_not_override_redirect(self):
+        self.transport.redirect = True
+        self.transport.query_result = {'result': 1, 'total': 1,
+                                       'list': [{'online_ip': self.transport.ip}]}
+        status = self.api.detect_network_status()
+        self.assertEqual(status.state, 'need_login')
+        self.assertEqual(status.redirect_url, PORTAL_ENTRY)
+
+    def test_invalid_and_conflicting_identity_never_submits(self):
+        cases = [
+            ('not-a-mac', {}),
+            ('12:3456:78:9A:BC', {}),
+            ('123456789ABC', {'olmac': 'AABBCCDDEEFF'}),
+            ('', {'olmac': 'not-a-mac'}),
+            ('', {'v46ip': 'bad-ip'}),
+            ('', {'v46ip': '10.40.20.99'}),
+            ('', {'v46ip': '127.0.0.1'}),
+            ('', {'v46ip': False}),
+        ]
+        for page_mac, identity in cases:
+            with self.subTest(page_mac=page_mac, identity=identity):
+                self.transport.page_mac = page_mac
+                self.transport.status_identity = identity
+                self.transport.redirect = True
+                result = self.api.login('student', 'secret', '中国移动')
+                self.assertFalse(result.success)
+                self.assertEqual(getattr(result, 'phase', None), 'not_submitted')
+        self.assertEqual(self.transport.submissions(), [])
+
+    def test_redirect_identity_conflict_blocks_submission(self):
+        self.transport.redirect = True
+        original = self.transport.get
+        def get(url, **kwargs):
+            response = original(url, **kwargs)
+            if url in dict(PROBES) and response.status_code == 302:
+                response.headers['Location'] = PORTAL_ENTRY + '?wlan_user_ip=10.40.20.99'
+            return response
+        self.transport.get = get
+        result = self.api.login('student', 'secret', '中国移动')
+        self.assertFalse(result.success)
+        self.assertIn('不一致', result.message)
+        self.assertEqual(self.transport.submissions(), [])
+
+    def test_missing_ip_still_blocks_with_redirect_and_missing_mac(self):
+        self.transport.missing_identity = self.transport.missing_mac = True
+        self.transport.redirect = True
+        result = self.api.login('student', 'secret', '中国移动')
+        self.assertFalse(result.success)
+        self.assertEqual(getattr(result, 'phase', None), 'not_submitted')
+        self.assertIn('出口 IP', result.message)
+        self.assertEqual(self.transport.submissions(), [])
+
+    def test_zero_mac_exception_is_scoped_to_known_router_protocol(self):
+        self.transport.missing_mac = True
+        self.transport.redirect = True
+        self.api.provider = 'other_provider'
+        result = self.api.login('student', 'secret', '中国移动')
+        self.assertFalse(result.success)
+        self.assertEqual(self.transport.submissions(), [])
+
+    def test_chkstatus_success_keeps_its_own_semantics(self):
+        self.transport.check_online_method = '0'
+        self.transport.online = True
+        self.assertEqual(self.api.detect_network_status().state, 'network_error')
+        self.transport.online = False
+        self.assertTrue(self.api.detect_network_status().need_login)
+
+    def test_independent_chkstatus_offline_recovers_with_unknown_list(self):
+        self.transport.missing_mac = True
+        self.transport.query_result = {'result': 0, 'msg': '获取用户在线信息失败！'}
+        self.transport.status_identity = {'msg': ''}
+        result = self.api.login('student', 'secret', '中国移动')
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(len(self.transport.submissions()), 1)
+        self.assertEqual(self.transport.submissions()[0]['wlan_user_mac'], '000000000000')
+        self.assertTrue(any('chkstatus' in line for line in result.raw.get('_debug_log', []) +
+                            result.status.debug_log))
+
+    def test_independent_chkstatus_handles_online_list_request_failure(self):
+        self.transport.missing_mac = True
+        self.transport.query_error = requests.ConnectionError('online_list unavailable')
+        self.assertTrue(self.api.login('student', 'secret', '中国移动').success)
+        self.assertEqual(len(self.transport.submissions()), 1)
+
+    def test_independent_chkstatus_online_blocks_reauthentication(self):
+        self.transport.online = True
+        self.transport.query_result = {'result': 0, 'msg': '内部错误'}
+        status = self.api.detect_network_status()
+        self.assertEqual(status.state, 'network_error')
+        self.assertFalse(self.api.login('student', 'secret', '中国移动').success)
+        self.assertEqual(self.transport.submissions(), [])
+
+    def test_independent_chkstatus_identity_conflict_blocks_submission(self):
+        self.transport.query_result = {'result': 0, 'msg': '内部错误'}
+        original = self.transport.get
+        count = 0
+        def get(url, **kwargs):
+            nonlocal count
+            if urlsplit(url).path == '/drcom/chkstatus':
+                count += 1
+                if count > 1:
+                    self.transport.status_identity = {'v46ip': '10.40.20.99'}
+            return original(url, **kwargs)
+        self.transport.get = get
+        result = self.api.login('student', 'secret', '中国移动')
+        self.assertFalse(result.success)
+        self.assertEqual(result.phase, 'not_submitted')
+        self.assertIn('不一致', result.message)
+        self.assertEqual(self.transport.submissions(), [])
+
+    def test_accepted_phase_survives_verification_exception(self):
+        detect = self.api.detect_network_status
+        self.api.detect_network_status = Mock(side_effect=[detect(), RuntimeError('verification failed')])
+        result = self.api.login('student', 'secret', '中国移动')
+        self.assertFalse(result.success)
+        self.assertEqual(getattr(result, 'phase', None), 'accepted')
+        self.assertEqual(len(self.transport.submissions()), 1)
 
     def test_online_never_submits_password(self):
         self.transport.internet = True
-        self.assertTrue(self.api.login('student', 'secret', '中国移动').success)
+        result = self.api.login('student', 'secret', '中国移动')
+        self.assertTrue(result.success)
+        self.assertEqual(getattr(result, 'phase', None), 'online')
         self.assertEqual(self.transport.submissions(), [])
 
     def test_single_probe_failure_does_not_trigger_auth(self):
@@ -137,6 +343,7 @@ class RouterAuthTests(unittest.TestCase):
 
     def test_arbitrary_query_error_remains_unknown(self):
         self.transport.query_result = {'result': 0, 'msg': '内部错误'}
+        self.transport.chkstatus_unknown = True
         status = self.api.detect_network_status()
         self.assertEqual(status.state, 'unknown')
         self.assertFalse(status.need_login)
@@ -181,6 +388,7 @@ class RouterAuthTests(unittest.TestCase):
         self.transport.login_message = '密码错误 secret http://host/login?user_password=secret'
         result = self.api.login('student', 'secret', '中国移动')
         self.assertTrue(result.permanent_error)
+        self.assertEqual(getattr(result, 'phase', None), 'failed')
         self.assertNotIn('secret', repr(result))
         self.assertNotIn('http://host', repr(result))
 
@@ -194,6 +402,7 @@ class RouterAuthTests(unittest.TestCase):
         result = self.api.login('student', 'secret', '中国移动')
         self.assertNotIn('secret', repr(result))
         self.assertIn('ConnectionError', result.message)
+        self.assertEqual(getattr(result, 'phase', None), 'failed')
 
     def test_cancel_before_submission(self):
         result = self.api.login('student', 'secret', '中国移动', cancelled=lambda: True)

@@ -615,7 +615,9 @@ class CampusNetApp:
             self._log(result.message, "ok")
         else:
             state = result.status.state if result.status else "unknown"
-            self._update_status_ui(state, "认证未恢复外网", result.message)
+            labels = {"not_submitted": "未提交认证", "failed": "认证失败",
+                      "accepted": "认证已接受，等待外网恢复"}
+            self._update_status_ui(state, labels[result.phase], result.message)
             self._log(result.message, "warn")
             if result.permanent_error:
                 self._log("自动认证已暂停，请修改账号配置或手动登录", "warn")

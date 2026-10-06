@@ -62,6 +62,7 @@ class LoginResult:
     raw: dict = field(default_factory=dict)
     permanent_error: bool = False
     status: Optional["NetworkStatus"] = None
+    phase: str = "not_submitted"
 
 
 @dataclass
@@ -137,13 +138,11 @@ class EPortalAPI:
             try:
                 context = self.refresh_context(status.debug_log, redirect_url=redirected)
                 status.context = context
-                payload = self._query_online(context)
-                value = str(payload.get("result", ""))
-                if value == "1":
+                online_state = self._query_auth_state(context, status.debug_log)
+                if online_state == "authenticated":
                     status.state = "network_error"
                     status.message = "门户确认已认证，但外网探测失败；原因未知"
-                    return status
-                if value == "0" and self._explicit_offline(payload):
+                elif online_state == "offline":
                     status.need_login, status.state = True, "need_login"
                     status.message = "门户确认当前出口未认证"
                 else:
@@ -159,6 +158,30 @@ class EPortalAPI:
                 status.redirect_url = redirected
                 status.message = "外网探测被重定向到校园认证门户"
             return status
+
+    def _query_auth_state(self, context, debug):
+        online_state = "unknown"
+        try:
+            payload = self._query_online(context)
+            online_state = self._online_state(context, payload)
+            result, total, records = payload.get("result"), payload.get("total"), payload.get("list")
+            result_label = str(result) if str(result) in ("0", "1") else "缺失或异常"
+            total_label = str(total) if type(total) is int or (isinstance(total, str) and total.isdecimal()) else "缺失或异常"
+            list_label = str(len(records)) if isinstance(records, list) else "缺失或异常"
+            debug.append(f"在线查询: result={result_label}, total={total_label}, list条数={list_label}, 判定={online_state}")
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            debug.append(f"在线查询失败: {self._safe_error(exc)}")
+        if (online_state == "unknown" and self.router_mode and self.provider == "drcom_new"
+                and self._is_portal(context.page_url) and str(context.config.get("check_online_method")) == "1"):
+            # 列表未知时，用门户内核对当前请求出口的独立状态码重新核验。
+            payload = self._request_jsonp_url(urljoin(context.page_url, "/drcom/chkstatus"),
+                                             {"callback": "dr1003"})
+            self._merge_identity(context, payload)
+            self._validate_identity(context)
+            value = str(payload.get("result", ""))
+            online_state = {"0": "offline", "1": "authenticated"}.get(value, "unknown")
+            debug.append(f"chkstatus: result={value if value in ('0', '1') else '缺失或异常'}, 判定={online_state}")
+        return online_state
 
     @staticmethod
     def _probe_matches(response, kind):
@@ -183,6 +206,43 @@ class EPortalAPI:
             "未登录", "未认证", "不在线", "没有在线", "无在线", "未在线",
             "not online", "not logged", "no online", "用户在线信息不存在"))
 
+    @staticmethod
+    def _online_state(context, payload):
+        result = str(payload.get("result", ""))
+        if str(context.config.get("check_online_method", "0")) != "1":
+            if result == "1":
+                return "authenticated"
+            return "offline" if result == "0" and EPortalAPI._explicit_offline(payload) else "unknown"
+
+        # online_list 的成功码只表示查询完成，认证状态取决于当前出口记录。
+        if result == "0" and "list" not in payload and "total" not in payload:
+            return "offline" if EPortalAPI._explicit_offline(payload) else "unknown"
+        records, total = payload.get("list"), payload.get("total")
+        if not isinstance(records, list) or isinstance(total, bool):
+            return "unknown"
+        if isinstance(total, str) and re.fullmatch(r"\d+", total):
+            total = int(total)
+        if not isinstance(total, int) or total < 0 or total != len(records):
+            return "unknown"
+        if result != "1":
+            return "offline" if result == "0" and total == 0 and EPortalAPI._explicit_offline(payload) else "unknown"
+        matched = False
+        for record in records:
+            if not isinstance(record, dict) or not isinstance(record.get("online_ip"), str):
+                return "unknown"
+            try:
+                online_ip = ipaddress.IPv4Address(record.get("online_ip", ""))
+                if online_ip.is_unspecified or online_ip.is_loopback or online_ip.is_multicast:
+                    return "unknown"
+            except (ValueError, TypeError):
+                return "unknown"
+            matched = matched or str(online_ip) == context.user_ip
+        if matched and EPortalAPI._explicit_offline(payload):
+            return "unknown"
+        if not matched and payload.get("online") is True:
+            return "unknown"
+        return "authenticated" if matched else "offline"
+
     def refresh_context(self, debug=None, *, redirect_url=""):
         self._context = None
         if self.router_mode:
@@ -193,8 +253,8 @@ class EPortalAPI:
             context = self._parse_context(response.url, response.text, self.portal_port)
             if redirect_url and self._is_portal(redirect_url):
                 redirected = self._parse_context(redirect_url, response.text, self.portal_port)
-                context.user_ip = redirected.user_ip or context.user_ip
-                context.user_mac = redirected.user_mac or context.user_mac
+                self._merge_identity(context, {"wlan_user_ip": redirected.user_ip,
+                                               "wlan_user_mac": redirected.user_mac})
                 for key in ("ac_ip", "ac_name", "vlan", "ssid", "area_id", "ap_mac",
                             "gw_id", "gw_port", "gw_address", "user_ipv6"):
                     setattr(context, key, getattr(redirected, key))
@@ -270,39 +330,47 @@ class EPortalAPI:
 
     @staticmethod
     def _merge_identity(context, payload):
-        def valid_ip(value):
+        ips = set()
+        for value in [context.user_ip] + [payload.get(key, "") for key in ("v46ip", "v4ip", "wlan_user_ip")]:
+            if value in ("", "0.0.0.0"):
+                continue
             try:
-                return not ipaddress.IPv4Address(value).is_unspecified
-            except ValueError:
-                return False
-        if not valid_ip(context.user_ip):
-            for key in ("v46ip", "v4ip", "wlan_user_ip"):
-                if valid_ip(str(payload.get(key, ""))):
-                    context.user_ip = str(payload[key])
-                    break
-        else:
-            for key in ("v46ip", "v4ip", "wlan_user_ip"):
-                candidate = str(payload.get(key, ""))
-                if valid_ip(candidate) and candidate != context.user_ip:
-                    raise ValueError("门户页面与在线查询的出口 IP 不一致，等待刷新")
-        mac = re.sub(r"[:-]", "", context.user_mac).upper()
-        if not re.fullmatch(r"[0-9A-F]{12}", mac) or mac in ("000000000000", "111111111111"):
-            for key in ("ss4", "olmac", "wlan_user_mac"):
-                candidate = re.sub(r"[:-]", "", str(payload.get(key, ""))).upper()
-                if re.fullmatch(r"[0-9A-F]{12}", candidate) and candidate not in ("000000000000", "111111111111"):
-                    mac = candidate
-                    break
-        context.user_mac = mac
+                if not isinstance(value, str):
+                    raise ValueError()
+                ip = ipaddress.IPv4Address(value)
+                if ip.is_unspecified or ip.is_loopback or ip.is_multicast:
+                    raise ValueError()
+            except (ValueError, TypeError):
+                raise ValueError("门户出口 IP 格式异常，未提交认证") from None
+            ips.add(str(ip))
+        if len(ips) > 1:
+            raise ValueError("门户页面与在线查询的出口 IP 不一致，等待刷新")
+        macs = set()
+        for value in [context.user_mac] + [payload.get(key, "") for key in ("ss4", "olmac", "wlan_user_mac")]:
+            if value == "":
+                continue
+            if not isinstance(value, str) or not re.fullmatch(
+                    r"[0-9A-Fa-f]{12}|(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}|(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}", value):
+                raise ValueError("门户出口 MAC 格式异常，未提交认证")
+            mac = re.sub(r"[:-]", "", value).upper()
+            if mac not in ("000000000000", "111111111111"):
+                macs.add(mac)
+        if len(macs) > 1:
+            raise ValueError("门户页面与在线查询的出口 MAC 不一致，等待刷新")
+        context.user_ip = next(iter(ips), "")
+        context.user_mac = next(iter(macs), "")
 
-    @staticmethod
-    def _validate_identity(context):
+    def _validate_identity(self, context):
         try:
             ip = ipaddress.IPv4Address(context.user_ip)
             if ip.is_unspecified or ip.is_loopback or ip.is_multicast:
                 raise ValueError()
         except ValueError:
             raise ValueError("门户未提供有效出口 IP，未提交认证") from None
-        if not re.fullmatch(r"[0-9A-F]{12}", context.user_mac) or context.user_mac in ("000000000000", "111111111111"):
+        if (not context.user_mac and self.router_mode and self.provider == "drcom_new"
+                and self._is_portal(context.page_url)):
+            context.user_mac = "000000000000"
+        elif not re.fullmatch(r"[0-9A-F]{12}", context.user_mac) or context.user_mac in ("000000000000", "111111111111"):
             raise ValueError("门户未提供有效出口 MAC，未提交认证")
 
     def _query_online(self, context):
@@ -323,8 +391,10 @@ class EPortalAPI:
             try:
                 self._check_cancelled(cancelled)
                 status = self.detect_network_status()
+                result.status = status
+                debug.extend(status.debug_log)
                 if status.online and not force_relogin:
-                    return LoginResult(success=True, message="当前已在线，无需重复认证", status=status)
+                    return LoginResult(success=True, message="当前已在线，无需重复认证", status=status, phase="online")
                 if not status.need_login and not (force_relogin and status.online):
                     return LoginResult(message=status.message, status=status)
                 context = self.refresh_context(debug, redirect_url=status.redirect_url)
@@ -340,12 +410,16 @@ class EPortalAPI:
                     "user_password": password, "program_index": context.config["program_index"],
                     "page_index": context.config["page_index"], "jsVersion": "4.X",
                     "terminal_type": "1", "lang": "zh-cn", "v": str(random.randint(500, 9999))})
+                result.phase = "failed"
                 payload = self._request_jsonp("/eportal/portal/login", params, context=context)
                 message = self._redact(str(payload.get("msg") or payload.get("message") or "认证失败"), password)
                 if str(payload.get("result", "")) in ("1", "ok", "success"):
+                    result.phase = "accepted"
                     self._check_cancelled(cancelled)
                     status = self.detect_network_status()
                     result.status, result.success = status, status.online
+                    if status.online:
+                        result.phase = "online"
                     result.message = "认证后外网连通性验证通过" if status.online else "门户接受认证，但外网尚未恢复；原因未知"
                 else:
                     result.message, result.permanent_error = message, self._permanent_error(message)

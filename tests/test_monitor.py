@@ -43,6 +43,78 @@ class MonitorTests(unittest.TestCase):
         monitor.step()
         self.assertEqual(len(transport.submissions()), 1)
 
+    def test_startup_without_mac_authenticates_and_publishes_result(self):
+        transport = PortalTransport()
+        transport.missing_mac = True
+        api = EPortalAPI(session=transport, router_mode=True)
+        restored = threading.Event()
+        events = []
+        def callback(kind, value):
+            events.append((kind, value))
+            if kind == 'login':
+                restored.set()
+        monitor = MaintenanceMonitor(api, self.settings, callback)
+        try:
+            monitor.start()
+            self.assertTrue(restored.wait(3), 'Startup authentication result not published')
+            self.assertTrue(monitor.last_status.online)
+            self.assertEqual(len(transport.submissions()), 1)
+            self.assertEqual(transport.submissions()[0]['wlan_user_mac'], '000000000000')
+            self.assertEqual(transport.submissions()[0]['user_account'], ',0,student@cmcc')
+            result = next(value for kind, value in events if kind == 'login')
+            self.assertEqual(getattr(result, 'phase', None), 'online')
+            monitor.step()
+            self.assertEqual(len(transport.submissions()), 1)
+        finally:
+            monitor.request_stop()
+            monitor.join(3)
+        self.assertFalse(monitor.is_running())
+        self.assertTrue(transport.closed)
+
+    def test_accepted_but_no_internet_does_not_repeat_login(self):
+        transport = PortalTransport()
+        transport.missing_mac = True
+        transport.restore_internet = False
+        api = EPortalAPI(session=transport, router_mode=True)
+        events = []
+        monitor = MaintenanceMonitor(api, self.settings, lambda kind, value: events.append((kind, value)))
+        self.assertEqual(monitor.step(), 30)
+        self.assertEqual(monitor.last_status.state, 'network_error')
+        self.assertEqual(monitor.step(), 60)
+        self.assertEqual(len(transport.submissions()), 1)
+        results = [value for kind, value in events if kind == 'login']
+        self.assertEqual(len(results), 1)
+        self.assertEqual(getattr(results[0], 'phase', None), 'accepted')
+
+    def test_password_error_without_mac_stops_automatic_submissions(self):
+        transport = PortalTransport()
+        transport.missing_mac = True
+        transport.accept_login = False
+        transport.login_message = '密码错误'
+        api = EPortalAPI(session=transport, router_mode=True)
+        monitor = MaintenanceMonitor(api, self.settings)
+        monitor.step()
+        monitor.step()
+        self.assertEqual(monitor.paused_reason, 'permanent')
+        self.assertEqual(len(transport.submissions()), 1)
+
+    def test_unknown_list_uses_kernel_evidence_and_logs_only_summary(self):
+        transport = PortalTransport()
+        transport.missing_mac = True
+        transport.query_result = {'result': 0, 'msg': 'query failure secret',
+                                  'user_account': 'private-account', 'user_password': 'secret'}
+        api = EPortalAPI(session=transport, router_mode=True)
+        logger = Mock()
+        monitor = MaintenanceMonitor(api, self.settings, logger=logger)
+        self.assertEqual(monitor.step(), 30)
+        self.assertTrue(monitor.last_status.online)
+        self.assertEqual(len(transport.submissions()), 1)
+        messages = [call.args[0] for call in logger.info.call_args_list]
+        self.assertTrue(any('在线查询: result=0' in message for message in messages))
+        self.assertTrue(any('chkstatus: result=0' in message for message in messages))
+        self.assertNotIn('private-account', repr(logger.mock_calls))
+        self.assertNotIn('secret', repr(logger.mock_calls))
+
     def test_password_error_pauses_until_configuration_changes(self):
         self.api.detect_network_status.return_value = NetworkStatus(need_login=True)
         self.api.login.return_value = LoginResult(message='密码错误', permanent_error=True)

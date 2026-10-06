@@ -8,7 +8,7 @@ Status: implemented
 
 ## Decision
 
-`drcom_api.AuthContext` 拥有当前出口身份和门户配置；路由器模式每次认证重新读取宿舍门户、`/drcom/chkstatus` 和 `/eportal/portal/page/loadConfig`。页面和在线结果矛盾、身份或配置缺失时拒绝发送密码。门户 JS `a41.js` 使用 `online_list`，`a43.js` 按 `account_prefix` 为电脑账号增加 `,0,`；当前现场配置 `login_method=1`、`account_prefix=1`、`check_online_method=1`。这些配置由运行时查询决定，不把现场 IP、MAC 或页面索引写死。
+`drcom_api.AuthContext` 拥有当前出口身份和门户配置；路由器模式每次认证重新读取宿舍门户、`/drcom/chkstatus` 和 `/eportal/portal/page/loadConfig`。页面和在线结果矛盾、出口 IP 或配置缺失时拒绝发送密码。门户 JS `a41.js` 使用 `online_list`，`a43.js` 按 `account_prefix` 为电脑账号增加 `,0,`；当前现场配置 `login_method=1`、`account_prefix=1`、`check_online_method=1`。这些配置由运行时查询决定，不把现场 IP、MAC 或页面索引写死。
 
 `MaintenanceMonitor` 拥有一个串行工作线程和请求队列；GUI 与后台入口共用该实现及 Windows 命名 mutex。状态由外网探测及只读门户查询决定，认证接口成功不等于外网恢复。在线时仅探测，不认证；临时失败使用 30/60/120/240/300 秒退避。
 
@@ -25,7 +25,7 @@ ConfigManager 迁移旧自动开关的 OR 到 `auto_maintain`。旧文件缺少 
 
 ## Consequences
 
-要求门户提供真实 MAC，缺失时保守等待；请求发出后不能撤销，只能等待其有界完成。强制会话到期无法通过探测流量保证延长。永久错误分类依赖明确响应文本，未知错误保持退避。一次客户端更新原子替换 EXE；不支持旧 EXE 继续处理路由器模式。
+真实 MAC 必需的限制已由 [到期后认证决策](2026-10-06-router-expiry-auth.md) 部分替代；该记录拥有缺少 MAC 的协议例外、在线列表语义和登录阶段。请求发出后不能撤销，只能等待其有界完成。强制会话到期无法通过探测流量保证延长。永久错误分类依赖明确响应文本，未知错误保持退避。一次客户端更新原子替换 EXE；不支持旧 EXE 继续处理路由器模式。
 
 ## Verification
 

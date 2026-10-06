@@ -119,6 +119,9 @@ class MaintenanceMonitor:
 
     def _status(self, status):
         self.last_status = status
+        if self.logger and not status.online:
+            for line in status.debug_log:
+                self.logger.info(line)
         self._emit("status", status)
 
     def start(self):
@@ -218,6 +221,7 @@ class MaintenanceMonitor:
             self._log(result.message, "ok" if result.success else "warn")
             if result.status:
                 self._status(result.status)
+            self._emit("login", result)
             if result.success:
                 return self._online()
             if result.permanent_error:

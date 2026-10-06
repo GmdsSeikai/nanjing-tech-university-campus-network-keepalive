@@ -64,6 +64,46 @@ class AppTests(unittest.TestCase):
         self.assertEqual(set(seen), {owner})
         self.assertEqual(self.gui.status_light._state, 'online')
 
+    def test_login_labels_describe_submission_phase(self):
+        cases = [('missing_identity', '未提交认证'), ('accept_login', '认证失败'),
+                 ('restore_internet', '认证已接受，等待外网恢复'), ('online', '✅ 已在线')]
+        for scenario, label in cases:
+            with self.subTest(scenario=scenario):
+                transport = PortalTransport()
+                if scenario == 'missing_identity':
+                    transport.missing_identity = True
+                elif scenario in ('accept_login', 'restore_internet'):
+                    setattr(transport, scenario, False)
+                api = EPortalAPI(session=transport, router_mode=True)
+                try:
+                    result = api.login('student', 'secret', '中国移动')
+                    self.gui._on_login_result(result)
+                    self.assertEqual(self.gui.status_label['text'], label)
+                    self.assertEqual(self.gui.status_detail['text'], result.message)
+                    self.assertEqual(str(self.gui.login_btn['state']), 'normal')
+                finally:
+                    api.close()
+
+    def test_automatic_login_result_reaches_ui(self):
+        self.transport.internet = False
+        self.transport.missing_mac = True
+        self.gui.username_var.set('student')
+        self.gui.password_var.set('secret')
+        self.gui.maintain_var.set(True)
+        results = []
+        original = self.gui._on_login_result
+        def on_result(result):
+            results.append((threading.get_ident(), result))
+            original(result)
+        self.gui._on_login_result = on_result
+        self.gui._save_credentials()
+        self.gui._on_maintain_toggle()
+        self.pump_until(lambda: bool(results))
+        self.assertEqual(results[0][0], threading.get_ident())
+        self.assertTrue(results[0][1].success)
+        self.assertEqual(self.gui.status_label['text'], '✅ 已在线')
+        self.assertEqual(len(self.transport.submissions()), 1)
+
     def test_save_starts_auto_monitor_and_logout_stays_paused(self):
         self.gui.username_var.set('student')
         self.gui.password_var.set('secret')
