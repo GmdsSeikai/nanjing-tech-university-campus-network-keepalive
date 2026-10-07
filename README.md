@@ -1,6 +1,25 @@
-# 校园网一键登录工具
+# 南京工业大学校园网保活工具
+
+**Nanjing Tech University Campus Network Keepalive Tool**
 
 Windows 桌面客户端，适配南京工业大学 Dr.COM 门户，支持中国移动和通过路由器认证。电脑与程序持续运行时，默认每 30 秒发送小体积 HTTP 探测，确认需要认证后自动恢复。
+
+## 功能
+
+- 一键登录：使用学号和统一身份认证密码完成校园网认证，支持中国移动账号后缀处理。
+- 自动保活与断线重连：定时检测外网连通性，确认认证到期后自动重新登录；临时失败按退避间隔重试。
+- 宿舍路由器认证：从学校门户获取当前出口身份，支持电脑通过宿舍路由器接入校园网。
+- 系统托盘运行：关闭窗口后继续监控，可从托盘恢复窗口或退出；单实例锁避免重复认证循环。
+- 本地配置与日志：使用 Windows DPAPI 加密保存密码，记录检测、认证和恢复状态。
+- 命令行运行：提供 `--monitor` 持续监控和 `--once` 单次检测模式，也可直接使用 Windows EXE。
+
+## 来源与修改
+
+本项目基于 [Jun-maxs/CampusNetLogin](https://github.com/Jun-maxs/CampusNetLogin) 修改，原作者为 [Jun-maxs](https://github.com/Jun-maxs)。感谢原作者提供校园网登录客户端、移动端与远程控制系统的基础代码；本仓库保留原有 Git 提交历史。
+
+本项目的主要修改包括南京工业大学 Dr.COM 门户适配、中国移动与宿舍路由器出口认证、自动保活与到期重认证、系统托盘与单实例控制、Windows DPAPI 密码保护，以及对应测试和 Windows 打包验证。原仓库的移动端与远程控制代码仍保留在 `mobile_app/`、`remote_control/` 等目录；桌面保活工具无需运行这些组件。
+
+公开仓库：[GmdsSeikai/nanjing-tech-university-campus-network-keepalive](https://github.com/GmdsSeikai/nanjing-tech-university-campus-network-keepalive)。
 
 ## 首次使用
 
